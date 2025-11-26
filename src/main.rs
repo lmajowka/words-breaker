@@ -49,11 +49,23 @@ fn main() -> Result<()> {
     if !found {
         println!(
             "No matching mnemonic found within the first {} permutations (elapsed: {:?})",
-            args.max_permutations, elapsed
+            format_number(args.max_permutations), elapsed
         );
     }
 
     Ok(())
+}
+
+fn format_number(n: usize) -> String {
+    if n >= 1_000_000_000 {
+        format!("{:.1}G", n as f64 / 1_000_000_000.0)
+    } else if n >= 1_000_000 {
+        format!("{:.1}M", n as f64 / 1_000_000.0)
+    } else if n >= 1_000 {
+        format!("{:.1}K", n as f64 / 1_000.0)
+    } else {
+        n.to_string()
+    }
 }
 
 fn parse_language(lang: &str) -> Result<Language> {
@@ -83,8 +95,8 @@ fn search_permutations(
     let secp = bitcoin::secp256k1::Secp256k1::new();
 
     for (i, perm) in words.iter().cloned().permutations(words.len()).take(max_permutations).enumerate() {
-        if i % 1000 == 0 && i > 0 {
-            println!("Checked {} permutations...", i);
+        if i % 100000 == 0 && i > 0 {
+            println!("Checked {} permutations...", format_number(i));
         }
 
         let phrase = perm.join(" ");
