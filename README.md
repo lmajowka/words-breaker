@@ -45,9 +45,12 @@ words-breaker <TARGET_ADDRESS> <WORD1> <WORD2> ... <WORD12> [OPTIONS]
 
 | Option | Default | Description |
 |--------|---------|-------------|
+| `-l, --language` | `english` | BIP-39 wordlist language |
 | `--max-permutations` | `1000000` | Maximum number of permutations to test |
 | `-h, --help` | | Print help |
 | `-V, --version` | | Print version |
+
+**Supported languages:** `english`, `portuguese`, `spanish`, `french`, `italian`, `czech`, `korean`, `japanese`, `chinese-simplified`, `chinese-traditional`
 
 ### Examples
 
@@ -59,6 +62,11 @@ words-breaker <TARGET_ADDRESS> <WORD1> <WORD2> ... <WORD12> [OPTIONS]
 **Linux / macOS:**
 ```bash
 ./target/release/words-breaker 1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa abandon ability able about above absent absorb abstract absurd abuse access accident --max-permutations 500000
+```
+
+**With Portuguese wordlist:**
+```bash
+./target/release/words-breaker 1CfntEjWHwCc7moXnMHUX8QuBJaakAnv8U bexiga bonde curativo nevoeiro mundial vareta urubu megafone cozinha livro surpresa senador -l portuguese
 ```
 
 ## How It Works

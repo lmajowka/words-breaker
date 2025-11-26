@@ -5,7 +5,7 @@ edition = "2021"
 
 [dependencies]
 bitcoin = { version = "0.32", features = ["std"] }
-bip39 = "2.0"
+bip39 = { version = "2.0", features = ["all-languages"] }
 clap = { version = "4.5", features = ["derive"] }
 itertools = "0.13"
  anyhow = "1.0"

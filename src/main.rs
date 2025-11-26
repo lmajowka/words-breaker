@@ -19,6 +19,10 @@ struct Args {
     /// Maximum number of permutations to test (to avoid 12! by default)
     #[arg(long, default_value_t = 1_000_000)]
     max_permutations: usize,
+
+    /// BIP-39 wordlist language (english, portuguese, spanish, french, italian, czech, korean, japanese, chinese-simplified, chinese-traditional)
+    #[arg(long, short, default_value = "english")]
+    language: String,
 }
 
 fn main() -> Result<()> {
@@ -38,7 +42,8 @@ fn main() -> Result<()> {
         .context("This tool currently only supports mainnet legacy addresses")?;
 
     let start = Instant::now();
-    let found = search_permutations(&args.words, &target_address, args.max_permutations)?;
+    let language = parse_language(&args.language)?;
+    let found = search_permutations(&args.words, &target_address, args.max_permutations, language)?;
     let elapsed = start.elapsed();
 
     if !found {
@@ -51,10 +56,27 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+fn parse_language(lang: &str) -> Result<Language> {
+    match lang.to_lowercase().as_str() {
+        "english" => Ok(Language::English),
+        "portuguese" => Ok(Language::Portuguese),
+        "spanish" => Ok(Language::Spanish),
+        "french" => Ok(Language::French),
+        "italian" => Ok(Language::Italian),
+        "czech" => Ok(Language::Czech),
+        "korean" => Ok(Language::Korean),
+        "japanese" => Ok(Language::Japanese),
+        "chinese-simplified" => Ok(Language::SimplifiedChinese),
+        "chinese-traditional" => Ok(Language::TraditionalChinese),
+        _ => anyhow::bail!("Unknown language: {}. Supported: english, portuguese, spanish, french, italian, czech, korean, japanese, chinese-simplified, chinese-traditional", lang),
+    }
+}
+
 fn search_permutations(
     words: &[String],
     target: &Address<NetworkChecked>,
     max_permutations: usize,
+    language: Language,
 ) -> Result<bool> {
     let derivation_path: DerivationPath = "m/44'/0'/0'/0/0".parse()?;
 
@@ -67,7 +89,7 @@ fn search_permutations(
 
         let phrase = perm.join(" ");
 
-        let mnemonic = match Mnemonic::parse_in_normalized(Language::English, &phrase) {
+        let mnemonic = match Mnemonic::parse_in_normalized(language, &phrase) {
             Ok(m) => m,
             Err(_) => continue, // skip invalid mnemonics
         };
