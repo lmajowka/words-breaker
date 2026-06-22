@@ -13,12 +13,14 @@ use std::sync::Arc;
 use std::time::Instant;
 
 #[derive(Parser, Debug)]
-#[command(about = "Try permutations of 12 BIP-39 words to match a BTC legacy address", version)]
+#[command(about = "Try permutations of BIP-39 words (10-12) to match a BTC legacy address. \
+Missing words (when 10 or 11 are given) are filled from the 2048-word BIP-39 list.", version)]
 struct Args {
     /// Target legacy Bitcoin address (Base58, starting with '1')
     target_address: String,
 
-    /// Exactly 12 words (unordered or partially ordered)
+    /// 10, 11, or 12 words (unordered or partially ordered). Missing words are
+    /// completed from the BIP-39 wordlist.
     words: Vec<String>,
 
     /// Maximum number of permutations to test (to avoid 12! by default)
@@ -37,8 +39,8 @@ struct Args {
 fn main() -> Result<()> {
     let args = Args::parse();
 
-    if args.words.len() != 12 {
-        anyhow::bail!("Expected exactly 12 words, got {}", args.words.len());
+    if !(10..=12).contains(&args.words.len()) {
+        anyhow::bail!("Expected 10, 11, or 12 words, got {}", args.words.len());
     }
 
     let num_threads = if args.threads == 0 {
@@ -118,37 +120,55 @@ fn search_permutations_parallel(
     // Create shared Secp256k1 context (thread-safe)
     let secp = Arc::new(Secp256k1::new());
 
+    // A valid BIP-39 mnemonic needs 12 words. Whatever is missing is completed
+    // from the full 2048-word list for the chosen language.
+    let missing = 12 - words.len();
+
+    // `words_by_prefix("")` matches every word, so it yields the full wordlist.
+    let wordlist: &'static [&'static str] = language.words_by_prefix("");
+
+    if missing > 0 {
+        println!(
+            "Got {} words; completing {} missing word(s) from the {}-word BIP-39 list.",
+            words.len(),
+            missing,
+            wordlist.len()
+        );
+    }
+
+    // Build the candidate phrases in priority order, capped at max_permutations.
+    // The known words are permuted (itertools yields the order you typed them
+    // first), and the missing word(s) are inserted into every gap from the
+    // wordlist. This is collected up front so the expensive key derivation below
+    // can run in parallel; generating the phrases themselves is cheap.
+    let mut candidates: Vec<String> = Vec::new();
+    for base in words.iter().cloned().permutations(words.len()) {
+        if !fill_collect(&base, missing, wordlist, &mut candidates, max_permutations) {
+            break;
+        }
+    }
+
+    let total = candidates.len();
+    println!("Testing {} candidates...", format_number(total));
+    let _ = io::stdout().flush();
+
     let counter = Arc::new(AtomicUsize::new(0));
     let found = Arc::new(AtomicBool::new(false));
     let found_phrase = Arc::new(std::sync::Mutex::new(String::new()));
     let found_index = Arc::new(AtomicUsize::new(0));
 
-    let permutations: Vec<_> = words
-        .iter()
-        .cloned()
-        .permutations(words.len())
-        .take(max_permutations)
-        .enumerate()
-        .collect();
-
-    let total = permutations.len();
-    println!("Testing {} permutations...", format_number(total));
-    let _ = io::stdout().flush();
-
-    permutations.par_iter().for_each(|(idx, perm)| {
+    candidates.par_iter().enumerate().for_each(|(idx, phrase)| {
         if found.load(Ordering::Relaxed) {
             return;
         }
 
         let i = counter.fetch_add(1, Ordering::Relaxed);
         if i % 100000 == 0 && i > 0 {
-            println!("Checked {} permutations...", format_number(i));
+            println!("Checked {} candidates...", format_number(i));
             let _ = io::stdout().flush();
         }
 
-        let phrase = perm.join(" ");
-
-        let mnemonic = match Mnemonic::parse_in_normalized(language, &phrase) {
+        let mnemonic = match Mnemonic::parse_in_normalized(language, phrase) {
             Ok(m) => m,
             Err(_) => return,
         };
@@ -171,9 +191,9 @@ fn search_permutations_parallel(
 
         if addr.to_string() == target_str {
             found.store(true, Ordering::SeqCst);
-            found_index.store(*idx, Ordering::SeqCst);
+            found_index.store(idx, Ordering::SeqCst);
             let mut fp = found_phrase.lock().unwrap();
-            *fp = phrase;
+            *fp = phrase.clone();
         }
     });
 
@@ -181,10 +201,65 @@ fn search_permutations_parallel(
         let fp = found_phrase.lock().unwrap();
         let idx = found_index.load(Ordering::SeqCst);
         println!("Found matching mnemonic: {}", *fp);
-        println!("Permutation index (0-based): {}", idx);
+        if missing > 0 {
+            let recovered = recovered_words(words, &fp);
+            println!("Recovered missing word(s): {}", recovered.join(" "));
+        }
+        println!("Candidate index (0-based): {}", idx);
         println!("Derived address: {}", target_str);
         Ok(true)
     } else {
         Ok(false)
     }
+}
+
+/// Inserts `remaining` words from `wordlist` into every gap of `seq`, recursing
+/// until full 12-word phrases are built, pushing each onto `out`. Returns false
+/// (and stops) once `out` reaches `max` candidates.
+fn fill_collect(
+    seq: &[String],
+    remaining: usize,
+    wordlist: &[&str],
+    out: &mut Vec<String>,
+    max: usize,
+) -> bool {
+    if out.len() >= max {
+        return false;
+    }
+
+    if remaining == 0 {
+        out.push(seq.join(" "));
+        return out.len() < max;
+    }
+
+    for pos in 0..=seq.len() {
+        for &word in wordlist {
+            let mut next = Vec::with_capacity(seq.len() + 1);
+            next.extend_from_slice(&seq[..pos]);
+            next.push(word.to_string());
+            next.extend_from_slice(&seq[pos..]);
+
+            if !fill_collect(&next, remaining - 1, wordlist, out, max) {
+                return false;
+            }
+        }
+    }
+
+    true
+}
+
+/// Returns the words in `phrase` that were not part of the originally supplied
+/// `known` words (i.e. the words recovered from the wordlist), as a multiset
+/// difference.
+fn recovered_words(known: &[String], phrase: &str) -> Vec<String> {
+    let mut remaining: Vec<String> = known.to_vec();
+    let mut recovered = Vec::new();
+    for word in phrase.split_whitespace() {
+        if let Some(pos) = remaining.iter().position(|k| k == word) {
+            remaining.remove(pos);
+        } else {
+            recovered.push(word.to_string());
+        }
+    }
+    recovered
 }
