@@ -2,9 +2,14 @@ use anyhow::{Context, Result};
 use bip39::{Language, Mnemonic};
 use bitcoin::address::{Address, NetworkChecked, NetworkUnchecked};
 use bitcoin::bip32::{DerivationPath, Xpriv};
+use bitcoin::secp256k1::Secp256k1;
 use bitcoin::{Network, PublicKey};
 use clap::Parser;
 use itertools::Itertools;
+use rayon::prelude::*;
+use std::io::{self, Write};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::Instant;
 
 #[derive(Parser, Debug)]
@@ -23,6 +28,10 @@ struct Args {
     /// BIP-39 wordlist language (english, portuguese, spanish, french, italian, czech, korean, japanese, chinese-simplified, chinese-traditional)
     #[arg(long, short, default_value = "english")]
     language: String,
+
+    /// Number of threads to use (defaults to number of CPU cores)
+    #[arg(long, short, default_value_t = 0)]
+    threads: usize,
 }
 
 fn main() -> Result<()> {
@@ -31,6 +40,19 @@ fn main() -> Result<()> {
     if args.words.len() != 12 {
         anyhow::bail!("Expected exactly 12 words, got {}", args.words.len());
     }
+
+    let num_threads = if args.threads == 0 {
+        num_cpus::get()
+    } else {
+        args.threads
+    };
+
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(num_threads)
+        .build_global()
+        .context("Failed to build thread pool")?;
+
+    println!("Using {} threads", num_threads);
 
     let target_address_unchecked = args
         .target_address
@@ -43,7 +65,7 @@ fn main() -> Result<()> {
 
     let start = Instant::now();
     let language = parse_language(&args.language)?;
-    let found = search_permutations(&args.words, &target_address, args.max_permutations, language)?;
+    let found = search_permutations_parallel(&args.words, &target_address, args.max_permutations, language)?;
     let elapsed = start.elapsed();
 
     if !found {
@@ -84,47 +106,85 @@ fn parse_language(lang: &str) -> Result<Language> {
     }
 }
 
-fn search_permutations(
+fn search_permutations_parallel(
     words: &[String],
     target: &Address<NetworkChecked>,
     max_permutations: usize,
     language: Language,
 ) -> Result<bool> {
     let derivation_path: DerivationPath = "m/44'/0'/0'/0/0".parse()?;
+    let target_str = target.to_string();
 
-    let secp = bitcoin::secp256k1::Secp256k1::new();
+    // Create shared Secp256k1 context (thread-safe)
+    let secp = Arc::new(Secp256k1::new());
 
-    for (i, perm) in words.iter().cloned().permutations(words.len()).take(max_permutations).enumerate() {
+    let counter = Arc::new(AtomicUsize::new(0));
+    let found = Arc::new(AtomicBool::new(false));
+    let found_phrase = Arc::new(std::sync::Mutex::new(String::new()));
+    let found_index = Arc::new(AtomicUsize::new(0));
+
+    let permutations: Vec<_> = words
+        .iter()
+        .cloned()
+        .permutations(words.len())
+        .take(max_permutations)
+        .enumerate()
+        .collect();
+
+    let total = permutations.len();
+    println!("Testing {} permutations...", format_number(total));
+    let _ = io::stdout().flush();
+
+    permutations.par_iter().for_each(|(idx, perm)| {
+        if found.load(Ordering::Relaxed) {
+            return;
+        }
+
+        let i = counter.fetch_add(1, Ordering::Relaxed);
         if i % 100000 == 0 && i > 0 {
             println!("Checked {} permutations...", format_number(i));
+            let _ = io::stdout().flush();
         }
 
         let phrase = perm.join(" ");
 
         let mnemonic = match Mnemonic::parse_in_normalized(language, &phrase) {
             Ok(m) => m,
-            Err(_) => continue, // skip invalid mnemonics
+            Err(_) => return,
         };
 
         let seed = mnemonic.to_seed("");
 
-        let master_xprv = Xpriv::new_master(Network::Bitcoin, &seed)
-            .context("Failed to create master xprv")?;
+        let master_xprv = match Xpriv::new_master(Network::Bitcoin, &seed) {
+            Ok(x) => x,
+            Err(_) => return,
+        };
 
-        let child_xprv = master_xprv.derive_priv(&secp, &derivation_path)?;
+        let child_xprv = match master_xprv.derive_priv(&secp, &derivation_path) {
+            Ok(x) => x,
+            Err(_) => return,
+        };
 
         let child_priv = child_xprv.private_key;
         let child_pub = PublicKey::new(child_priv.public_key(&secp));
-
         let addr: Address<NetworkChecked> = Address::p2pkh(&child_pub, Network::Bitcoin);
 
-        if &addr == target {
-            println!("Found matching mnemonic: {}", phrase);
-            println!("Permutation index (0-based within search): {}", i);
-            println!("Derived address: {}", addr);
-            return Ok(true);
+        if addr.to_string() == target_str {
+            found.store(true, Ordering::SeqCst);
+            found_index.store(*idx, Ordering::SeqCst);
+            let mut fp = found_phrase.lock().unwrap();
+            *fp = phrase;
         }
-    }
+    });
 
-    Ok(false)
+    if found.load(Ordering::SeqCst) {
+        let fp = found_phrase.lock().unwrap();
+        let idx = found_index.load(Ordering::SeqCst);
+        println!("Found matching mnemonic: {}", *fp);
+        println!("Permutation index (0-based): {}", idx);
+        println!("Derived address: {}", target_str);
+        Ok(true)
+    } else {
+        Ok(false)
+    }
 }
