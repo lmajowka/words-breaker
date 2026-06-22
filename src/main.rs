@@ -6,6 +6,7 @@ use bitcoin::secp256k1::Secp256k1;
 use bitcoin::{Network, PublicKey};
 use clap::Parser;
 use itertools::Itertools;
+use rayon::iter::ParallelBridge;
 use rayon::prelude::*;
 use std::io::{self, Write};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -22,10 +23,6 @@ struct Args {
     /// 10, 11, or 12 words (unordered or partially ordered). Missing words are
     /// completed from the BIP-39 wordlist.
     words: Vec<String>,
-
-    /// Maximum number of permutations to test (to avoid 12! by default)
-    #[arg(long, default_value_t = 1_000_000)]
-    max_permutations: usize,
 
     /// BIP-39 wordlist language (english, portuguese, spanish, french, italian, czech, korean, japanese, chinese-simplified, chinese-traditional)
     #[arg(long, short, default_value = "english")]
@@ -67,13 +64,13 @@ fn main() -> Result<()> {
 
     let start = Instant::now();
     let language = parse_language(&args.language)?;
-    let found = search_permutations_parallel(&args.words, &target_address, args.max_permutations, language)?;
+    let found = search_permutations_parallel(&args.words, &target_address, language)?;
     let elapsed = start.elapsed();
 
     if !found {
         println!(
-            "No matching mnemonic found within the first {} permutations (elapsed: {:?})",
-            format_number(args.max_permutations), elapsed
+            "Exhausted all permutations without a match (elapsed: {:?})",
+            elapsed
         );
     }
 
@@ -111,7 +108,6 @@ fn parse_language(lang: &str) -> Result<Language> {
 fn search_permutations_parallel(
     words: &[String],
     target: &Address<NetworkChecked>,
-    max_permutations: usize,
     language: Language,
 ) -> Result<bool> {
     let derivation_path: DerivationPath = "m/44'/0'/0'/0/0".parse()?;
@@ -136,28 +132,29 @@ fn search_permutations_parallel(
         );
     }
 
-    // Build the candidate phrases in priority order, capped at max_permutations.
-    // The known words are permuted (itertools yields the order you typed them
-    // first), and the missing word(s) are inserted into every gap from the
-    // wordlist. This is collected up front so the expensive key derivation below
-    // can run in parallel; generating the phrases themselves is cheap.
-    let mut candidates: Vec<String> = Vec::new();
-    for base in words.iter().cloned().permutations(words.len()) {
-        if !fill_collect(&base, missing, wordlist, &mut candidates, max_permutations) {
-            break;
-        }
-    }
-
-    let total = candidates.len();
-    println!("Testing {} candidates...", format_number(total));
+    let total = total_candidates(words.len(), wordlist.len(), missing);
+    println!(
+        "Searching {} candidates (streamed, not held in memory)...",
+        format_number(total)
+    );
     let _ = io::stdout().flush();
+
+    // Stream candidate phrases lazily: known words are permuted, and missing
+    // word(s) are inserted into every gap from the wordlist on demand. Nothing
+    // is collected up front, so memory stays flat regardless of how many
+    // candidates exist.
+    let owned_words: Vec<String> = words.to_vec();
+    let candidates = owned_words
+        .into_iter()
+        .permutations(words.len())
+        .flat_map(move |base| insert_missing(base, missing, wordlist).map(|v| v.join(" ")));
 
     let counter = Arc::new(AtomicUsize::new(0));
     let found = Arc::new(AtomicBool::new(false));
     let found_phrase = Arc::new(std::sync::Mutex::new(String::new()));
     let found_index = Arc::new(AtomicUsize::new(0));
 
-    candidates.par_iter().enumerate().for_each(|(idx, phrase)| {
+    candidates.par_bridge().for_each(|phrase| {
         if found.load(Ordering::Relaxed) {
             return;
         }
@@ -168,7 +165,7 @@ fn search_permutations_parallel(
             let _ = io::stdout().flush();
         }
 
-        let mnemonic = match Mnemonic::parse_in_normalized(language, phrase) {
+        let mnemonic = match Mnemonic::parse_in_normalized(language, &phrase) {
             Ok(m) => m,
             Err(_) => return,
         };
@@ -191,9 +188,9 @@ fn search_permutations_parallel(
 
         if addr.to_string() == target_str {
             found.store(true, Ordering::SeqCst);
-            found_index.store(idx, Ordering::SeqCst);
+            found_index.store(i, Ordering::SeqCst);
             let mut fp = found_phrase.lock().unwrap();
-            *fp = phrase.clone();
+            *fp = phrase;
         }
     });
 
@@ -213,39 +210,36 @@ fn search_permutations_parallel(
     }
 }
 
-/// Inserts `remaining` words from `wordlist` into every gap of `seq`, recursing
-/// until full 12-word phrases are built, pushing each onto `out`. Returns false
-/// (and stops) once `out` reaches `max` candidates.
-fn fill_collect(
-    seq: &[String],
+/// Number of candidate phrases for `n` known words with `missing` slots filled
+/// from a wordlist of `wordlist_len` words: n! * wordlist_len^missing.
+fn total_candidates(n: usize, wordlist_len: usize, missing: usize) -> usize {
+    let factorial: usize = (1..=n).product::<usize>().max(1);
+    factorial * wordlist_len.pow(missing as u32)
+}
+
+/// Lazily inserts `remaining` words from `wordlist` into every gap of `seq`,
+/// recursing until full 12-word phrases are produced. `remaining` is at most 2
+/// (12 minus the 10-12 words the user supplies), so the recursion is shallow.
+fn insert_missing(
+    seq: Vec<String>,
     remaining: usize,
-    wordlist: &[&str],
-    out: &mut Vec<String>,
-    max: usize,
-) -> bool {
-    if out.len() >= max {
-        return false;
-    }
-
+    wordlist: &'static [&'static str],
+) -> Box<dyn Iterator<Item = Vec<String>> + Send> {
     if remaining == 0 {
-        out.push(seq.join(" "));
-        return out.len() < max;
+        return Box::new(std::iter::once(seq));
     }
 
-    for pos in 0..=seq.len() {
-        for &word in wordlist {
+    let len = seq.len();
+    Box::new((0..=len).flat_map(move |pos| {
+        let seq = seq.clone();
+        wordlist.iter().flat_map(move |&word| {
             let mut next = Vec::with_capacity(seq.len() + 1);
             next.extend_from_slice(&seq[..pos]);
             next.push(word.to_string());
             next.extend_from_slice(&seq[pos..]);
-
-            if !fill_collect(&next, remaining - 1, wordlist, out, max) {
-                return false;
-            }
-        }
-    }
-
-    true
+            insert_missing(next, remaining - 1, wordlist)
+        })
+    }))
 }
 
 /// Returns the words in `phrase` that were not part of the originally supplied
